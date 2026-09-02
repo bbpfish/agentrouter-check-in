@@ -22,18 +22,6 @@ BALANCE_HASH_FILE = 'balance_hash.txt'
 
 # 站点配置
 SITES = {
-    'agentrouter': {
-        'name': 'AgentRouter',
-        'base_url': 'https://agentrouter.org',
-        'sign_in_path': '/api/user/sign_in',
-        'user_info_path': '/api/user/self',
-        'accounts_env': 'AGENTROUTER_ACCOUNTS',
-        'needs_waf': True,
-        # 签到成功判断：ret==1 / code==0 / success
-        'check_success': lambda r: r.get('ret') == 1 or r.get('code') == 0 or r.get('success'),
-        # 余额单位换算（AgentRouter 除以 500000）
-        'quota_divisor': 500000,
-    },
     'hcnsec': {
         'name': 'HCN',
         'base_url': 'https://api.hcnsec.cn',
