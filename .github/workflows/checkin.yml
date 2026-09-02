@@ -72,7 +72,6 @@ jobs:
 
     - name: 执行签到
       env:
-        AGENTROUTER_ACCOUNTS: ${{ secrets.AGENTROUTER_ACCOUNTS }}
         HCN_ACCOUNTS: ${{ secrets.HCN_ACCOUNTS }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
