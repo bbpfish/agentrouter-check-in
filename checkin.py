@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
 多站点自动签到脚本 - AgentRouter + HCN
+支持 new-api (QuantumNous/new-api) Bearer 认证：
+账号配置提供 refresh_token 时，自动 POST /api/user/auth/refresh 换取 access_token，
+并使用 Bearer 认证调用 self/checkin；refresh 会轮换 refresh_token，
+脚本将最新 token 以 ##HCN_ACCOUNTS_B64## 标记输出，供 workflow 回写 GitHub Secrets。
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -29,6 +34,10 @@ SITES = {
         'user_info_path': '/api/user/self',
         'accounts_env': 'HCN_ACCOUNTS',
         'needs_waf': False,
+        # new-api Bearer 认证（refresh_token 模式）
+        'auth_mode': 'newapi_bearer',
+        'refresh_path': '/api/user/auth/refresh',
+        'refresh_cookie_name': 'new_api_refresh',
         # HCN 签到成功判断：success==true
         'check_success': lambda r: r.get('success') == True,
         # HCN 余额直接显示（不换算）
@@ -53,8 +62,10 @@ def load_accounts(env_var):
             if not isinstance(account, dict):
                 print(f'ERROR: Account {i + 1} configuration format is incorrect')
                 return None
-            if 'cookies' not in account or 'api_user' not in account:
-                print(f'ERROR: Account {i + 1} missing required fields (cookies, api_user)')
+            has_legacy = 'cookies' in account and 'api_user' in account
+            has_newapi = bool(account.get('refresh_token'))
+            if not (has_legacy or has_newapi):
+                print(f'ERROR: Account {i + 1} missing required fields (cookies+api_user or refresh_token)')
                 return None
             if 'name' in account and not account['name']:
                 print(f'ERROR: Account {i + 1} name field cannot be empty')
@@ -116,6 +127,51 @@ def parse_cookies(cookies_data):
                 cookies_dict[key] = value
         return cookies_dict
     return {}
+
+
+def refresh_newapi_token(site_config, refresh_token):
+    """new-api Bearer 认证：调用 /api/user/auth/refresh 换取 access_token。
+    返回 (access_token, new_refresh_token, error_msg)；refresh 会轮换 refresh_token。"""
+    base_url = site_config['base_url']
+    refresh_path = site_config['refresh_path']
+    cookie_name = site_config['refresh_cookie_name']
+
+    sid = refresh_token.split('.', 1)[0] if '.' in refresh_token else ''
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': f'{base_url}/console',
+        'Origin': base_url,
+        'Cookie': f'{cookie_name}={refresh_token}; new_api_has_session=1',
+        'X-Auth-Session': sid,
+        'Content-Type': 'application/json',
+    }
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(f'{base_url}{refresh_path}', json={}, headers=headers)
+            if resp.status_code != 200:
+                return None, None, f'Refresh failed: HTTP {resp.status_code}: {resp.text[:200]}'
+            data = resp.json()
+            access_token = (data.get('data') or {}).get('access_token')
+            if not access_token:
+                return None, None, f'Refresh failed: no access_token in response: {data.get("message", "")}'
+            # 从 Set-Cookie 提取轮换后的新 refresh token
+            new_refresh = None
+            for raw in resp.headers.get_list('set-cookie'):
+                part = raw.split(';', 1)[0]
+                if '=' in part:
+                    k, v = part.strip().split('=', 1)
+                    if k == cookie_name and v:
+                        new_refresh = v
+                        break
+            if not new_refresh:
+                new_refresh = refresh_token
+            return access_token, new_refresh, None
+    except Exception as e:
+        return None, None, f'Refresh exception: {str(e)[:200]}'
 
 
 async def get_waf_cookies_with_playwright(site_config, account_name):
@@ -222,35 +278,27 @@ async def check_in_account(site_config, account_info, account_index):
     sign_in_path = site_config['sign_in_path']
     needs_waf = site_config.get('needs_waf', False)
     check_success = site_config['check_success']
+    auth_mode = site_config.get('auth_mode', 'legacy_cookie')
 
     account_name = get_account_display_name(account_info, account_index)
     print(f'\n[PROCESSING] [{site_name}] Starting to process {account_name}')
 
-    cookies_data = account_info.get('cookies', {})
-    api_user = account_info.get('api_user', '')
+    refresh_token = account_info.get('refresh_token', '')
+    is_newapi = auth_mode == 'newapi_bearer' and bool(refresh_token)
 
-    if not api_user:
-        print(f'[FAILED] [{site_name}] {account_name}: API user identifier not found')
-        return False, None
+    if is_newapi:
+        # new-api Bearer 认证：先刷新拿 access_token
+        print(f'[PROCESSING] [{site_name}] {account_name}: Refreshing access token (new-api Bearer)')
+        access_token, new_refresh, err = refresh_newapi_token(site_config, refresh_token)
+        if not access_token:
+            print(f'[FAILED] [{site_name}] {account_name}: {err}')
+            return False, None, None
+        account_info['_new_refresh_token'] = new_refresh
+        if new_refresh and new_refresh != refresh_token:
+            print(f'[INFO] [{site_name}] {account_name}: Refresh token rotated, will sync back to secrets')
 
-    user_cookies = parse_cookies(cookies_data)
-    if not user_cookies:
-        print(f'[FAILED] [{site_name}] {account_name}: Invalid configuration format')
-        return False, None
-
-    # 获取 WAF cookies（如果站点需要）
-    waf_cookies = {}
-    if needs_waf:
-        waf_cookies = await get_waf_cookies_with_playwright(site_config, account_name)
-        if not waf_cookies:
-            print(f'[WARN] [{site_name}] {account_name}: No WAF cookies obtained, continuing without them')
-
-    client = httpx.Client(timeout=30.0)
-
-    try:
-        all_cookies = {**waf_cookies, **user_cookies}
-        client.cookies.update(all_cookies)
-
+        cookies_data = {}
+        api_user = account_info.get('api_user', '')
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
@@ -262,8 +310,51 @@ async def check_in_account(site_config, account_info, account_index):
             'Sec-Fetch-Dest': 'empty',
             'Sec-Fetch-Mode': 'cors',
             'Sec-Fetch-Site': 'same-origin',
-            'new-api-user': api_user,
+            'Authorization': f'Bearer {access_token}',
         }
+        if api_user:
+            headers['new-api-user'] = api_user
+    else:
+        cookies_data = account_info.get('cookies', {})
+        api_user = account_info.get('api_user', '')
+
+        if not api_user:
+            print(f'[FAILED] [{site_name}] {account_name}: API user identifier not found')
+            return False, None, None
+
+        user_cookies = parse_cookies(cookies_data)
+        if not user_cookies:
+            print(f'[FAILED] [{site_name}] {account_name}: Invalid configuration format')
+            return False, None, None
+
+        cookies_data = user_cookies
+
+    # 获取 WAF cookies（如果站点需要）
+    waf_cookies = {}
+    if needs_waf:
+        waf_cookies = await get_waf_cookies_with_playwright(site_config, account_name)
+        if not waf_cookies:
+            print(f'[WARN] [{site_name}] {account_name}: No WAF cookies obtained, continuing without them')
+
+    client = httpx.Client(timeout=30.0)
+
+    try:
+        if not is_newapi:
+            all_cookies = {**waf_cookies, **cookies_data}
+            client.cookies.update(all_cookies)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br, zstd',
+                'Referer': f'{base_url}/console',
+                'Origin': base_url,
+                'Connection': 'keep-alive',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin',
+                'new-api-user': api_user,
+            }
 
         user_info = get_user_info(client, headers, site_config)
         if user_info and user_info.get('success'):
@@ -284,29 +375,29 @@ async def check_in_account(site_config, account_info, account_index):
                 result = response.json()
                 if check_success(result):
                     print(f'[SUCCESS] [{site_name}] {account_name}: Check-in successful!')
-                    return True, user_info
+                    return True, user_info, (new_refresh if is_newapi else None)
                 else:
                     error_msg = result.get('msg', result.get('message', 'Unknown error'))
                     print(f'[INFO] [{site_name}] {account_name}: Check-in result - {error_msg}')
                     # "今日已签到"也算成功
                     if '已签到' in str(error_msg) or 'already' in str(error_msg).lower():
                         print(f'[SUCCESS] [{site_name}] {account_name}: Already checked in today')
-                        return True, user_info
-                    return False, user_info
+                        return True, user_info, (new_refresh if is_newapi else None)
+                    return False, user_info, (new_refresh if is_newapi else None)
             except json.JSONDecodeError:
                 if 'success' in response.text.lower():
                     print(f'[SUCCESS] [{site_name}] {account_name}: Check-in successful!')
-                    return True, user_info
+                    return True, user_info, (new_refresh if is_newapi else None)
                 else:
                     print(f'[FAILED] [{site_name}] {account_name}: Check-in failed - Invalid response format')
-                    return False, user_info
+                    return False, user_info, (new_refresh if is_newapi else None)
         else:
             print(f'[FAILED] [{site_name}] {account_name}: Check-in failed - HTTP {response.status_code}')
-            return False, user_info
+            return False, user_info, (new_refresh if is_newapi else None)
 
     except Exception as e:
         print(f'[FAILED] [{site_name}] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
-        return False, None
+        return False, None, (new_refresh if is_newapi else None)
     finally:
         client.close()
 
@@ -323,14 +414,14 @@ async def process_site(site_key, site_config):
     accounts = load_accounts(env_var)
     if accounts is None:
         print(f'[INFO] {site_name}: No account configuration found ({env_var} not set), skipping')
-        return []
+        return [], None
 
     print(f'[INFO] {site_name}: Found {len(accounts)} account(s)')
 
     results = []
     for i, account in enumerate(accounts):
         try:
-            success, user_info = await check_in_account(site_config, account, i)
+            success, user_info, _ = await check_in_account(site_config, account, i)
             account_name = get_account_display_name(account, i)
             results.append({
                 'site': site_name,
@@ -350,7 +441,27 @@ async def process_site(site_key, site_config):
                 'user_info': None,
             })
 
-    return results
+    return results, accounts
+
+
+def emit_accounts_sync_payload(accounts_by_env):
+    """输出更新后的账号配置（含轮换后的新 refresh_token），供 workflow 回写 Secrets。
+    输出格式：##HCN_ACCOUNTS_B64##<base64(json)>"""
+    try:
+        accounts = accounts_by_env.get('HCN_ACCOUNTS')
+        if not isinstance(accounts, list):
+            return
+        changed = False
+        for acc in accounts:
+            if isinstance(acc, dict) and acc.get('_new_refresh_token'):
+                acc['refresh_token'] = acc['_new_refresh_token']
+                acc.pop('_new_refresh_token', None)
+                changed = True
+        if changed:
+            payload = base64.b64encode(json.dumps(accounts, ensure_ascii=False).encode('utf-8')).decode('ascii')
+            print(f'##HCN_ACCOUNTS_B64##{payload}')
+    except Exception as e:
+        print(f'[WARN] Failed to emit accounts sync payload: {e}')
 
 
 async def main():
@@ -363,9 +474,12 @@ async def main():
 
     # 处理所有站点
     all_results = []
+    accounts_by_env = {}
     for site_key, site_config in SITES.items():
-        results = await process_site(site_key, site_config)
+        results, accounts = await process_site(site_key, site_config)
         all_results.extend(results)
+        if accounts is not None:
+            accounts_by_env[site_config['accounts_env']] = accounts
 
     if not all_results:
         print('[FAILED] No accounts configured for any site, program exits')
@@ -457,6 +571,9 @@ async def main():
         print('[NOTIFY] Notification sent')
     else:
         print('[INFO] All accounts successful and no balance changes detected, notification skipped')
+
+    # 输出轮换后的账号配置（供 workflow 回写 Secrets）
+    emit_accounts_sync_payload(accounts_by_env)
 
     sys.exit(0 if success_count > 0 else 1)
 
