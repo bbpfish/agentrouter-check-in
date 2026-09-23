@@ -71,6 +71,7 @@ jobs:
           balance-hash-
 
     - name: 执行签到
+      shell: pwsh
       env:
         HCN_ACCOUNTS: ${{ secrets.HCN_ACCOUNTS }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
@@ -82,7 +83,25 @@ jobs:
         FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
         WEIXIN_WEBHOOK: ${{ secrets.WEIXIN_WEBHOOK }}
       run: |
-        uv run checkin.py
+        $output = uv run checkin.py 2>&1 | Out-String
+        Write-Output $output
+        $output | Out-File -FilePath checkin_output.txt -Encoding utf8
+
+    - name: 同步轮换后的令牌到 Secrets
+      if: always()
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      run: |
+        $content = Get-Content -Raw checkin_output.txt -ErrorAction SilentlyContinue
+        if ($content -match '##HCN_ACCOUNTS_B64##(\S+)') {
+          $b64 = $Matches[1]
+          $json = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($b64))
+          gh secret set HCN_ACCOUNTS --repo "$env:GITHUB_REPOSITORY" --body $json
+          Write-Output "HCN_ACCOUNTS secret updated (refresh token rotated)"
+        } else {
+          Write-Output "No rotation payload, skip secret update"
+        }
 
     - name: 执行结果
       if: always()
