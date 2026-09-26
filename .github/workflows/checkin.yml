@@ -1,4 +1,4 @@
-name: AgentRouter 自动签到
+﻿name: AgentRouter 自动签到
 # Auto check-in workflow
 on:
   schedule:
@@ -74,6 +74,7 @@ jobs:
       shell: pwsh
       env:
         HCN_ACCOUNTS: ${{ secrets.HCN_ACCOUNTS }}
+        JUSTWORKER_ACCOUNTS: ${{ secrets.JUSTWORKER_ACCOUNTS }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
         EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
@@ -94,13 +95,16 @@ jobs:
         GH_TOKEN: ${{ secrets.GH_TOKEN }}
       run: |
         $content = Get-Content -Raw checkin_output.txt -ErrorAction SilentlyContinue
-        if ($content -match '##HCN_ACCOUNTS_B64##(\S+)') {
-          $b64 = $Matches[1]
-          $json = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($b64))
-          gh secret set HCN_ACCOUNTS --repo "$env:GITHUB_REPOSITORY" --body $json
-          Write-Output "HCN_ACCOUNTS secret updated (refresh token rotated)"
-        } else {
-          Write-Output "No rotation payload, skip secret update"
+        foreach ($envName in @('HCN_ACCOUNTS','JUSTWORKER_ACCOUNTS')) {
+          $pattern = '##' + $envName + '_B64##(\S+)'
+          if ($content -match $pattern) {
+            $b64 = $Matches[1]
+            $json = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($b64))
+            gh secret set $envName --repo "$env:GITHUB_REPOSITORY" --body $json
+            Write-Output "$envName secret updated (refresh token rotated)"
+          } else {
+            Write-Output "No rotation payload for $envName, skip secret update"
+          }
         }
 
     - name: 执行结果
@@ -108,3 +112,4 @@ jobs:
       run: |
         echo "签到任务执行完成"
         echo "时间: $(Get-Date)"
+
