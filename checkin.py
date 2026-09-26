@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-多站点自动签到脚本 - AgentRouter + HCN
+多站点自动签到脚本 - HCN + JustWorker 等 new-api 站点
 支持 new-api (QuantumNous/new-api) Bearer 认证：
 账号配置提供 refresh_token 时，自动 POST /api/user/auth/refresh 换取 access_token，
 并使用 Bearer 认证调用 self/checkin；refresh 会轮换 refresh_token，
-脚本将最新 token 以 ##HCN_ACCOUNTS_B64## 标记输出，供 workflow 回写 GitHub Secrets。
+脚本将最新 token 以 ##<ENV>_B64## 标记输出，供 workflow 回写 GitHub Secrets。
 """
 
 import asyncio
@@ -41,6 +41,22 @@ SITES = {
         # HCN 签到成功判断：success==true
         'check_success': lambda r: r.get('success') == True,
         # HCN 余额直接显示（不换算）
+        'quota_divisor': 1,
+    },
+    'justworker': {
+        'name': 'JustWorker',
+        'base_url': 'https://api.justwoker.icu',
+        'sign_in_path': '/api/user/checkin',
+        'user_info_path': '/api/user/self',
+        'accounts_env': 'JUSTWORKER_ACCOUNTS',
+        'needs_waf': False,
+        # new-api Bearer 认证（refresh_token 模式）
+        'auth_mode': 'newapi_bearer',
+        'refresh_path': '/api/user/auth/refresh',
+        'refresh_cookie_name': 'new_api_refresh',
+        # JustWorker 签到成功判断：success==true
+        'check_success': lambda r: r.get('success') == True,
+        # JustWorker 余额直接显示（不换算）
         'quota_divisor': 1,
     },
 }
@@ -446,20 +462,20 @@ async def process_site(site_key, site_config):
 
 def emit_accounts_sync_payload(accounts_by_env):
     """输出更新后的账号配置（含轮换后的新 refresh_token），供 workflow 回写 Secrets。
-    输出格式：##HCN_ACCOUNTS_B64##<base64(json)>"""
+    输出格式：##<ENV>_B64##<base64(json)>"""
     try:
-        accounts = accounts_by_env.get('HCN_ACCOUNTS')
-        if not isinstance(accounts, list):
-            return
-        changed = False
-        for acc in accounts:
-            if isinstance(acc, dict) and acc.get('_new_refresh_token'):
-                acc['refresh_token'] = acc['_new_refresh_token']
-                acc.pop('_new_refresh_token', None)
-                changed = True
-        if changed:
-            payload = base64.b64encode(json.dumps(accounts, ensure_ascii=False).encode('utf-8')).decode('ascii')
-            print(f'##HCN_ACCOUNTS_B64##{payload}')
+        for env_var, accounts in accounts_by_env.items():
+            if not isinstance(accounts, list):
+                continue
+            changed = False
+            for acc in accounts:
+                if isinstance(acc, dict) and acc.get('_new_refresh_token'):
+                    acc['refresh_token'] = acc['_new_refresh_token']
+                    acc.pop('_new_refresh_token', None)
+                    changed = True
+            if changed:
+                payload = base64.b64encode(json.dumps(accounts, ensure_ascii=False).encode('utf-8')).decode('ascii')
+                print(f'##{env_var}_B64##{payload}')
     except Exception as e:
         print(f'[WARN] Failed to emit accounts sync payload: {e}')
 
@@ -592,3 +608,4 @@ def run_main():
 
 if __name__ == '__main__':
     run_main()
+
