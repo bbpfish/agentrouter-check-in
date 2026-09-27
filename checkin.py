@@ -62,6 +62,26 @@ SITES = {
 }
 
 
+def _decode_response(response):
+    """解码响应体，兼容 GBK 等非 UTF-8 站点响应"""
+    raw = response.content
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError:
+        pass
+    for enc in ('gb18030', 'gbk', 'latin-1'):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode('utf-8', errors='replace')
+
+
+def _json_of(response):
+    """安全解析 JSON，兼容非 UTF-8 编码响应体"""
+    return json.loads(_decode_response(response))
+
+
 def load_accounts(env_var):
     """从环境变量加载多账号配置"""
     accounts_str = os.getenv(env_var)
@@ -169,7 +189,7 @@ def refresh_newapi_token(site_config, refresh_token):
         with httpx.Client(timeout=30.0) as client:
             resp = client.post(f'{base_url}{refresh_path}', json={}, headers=headers)
             if resp.status_code != 200:
-                return None, None, f'Refresh failed: HTTP {resp.status_code}: {resp.text[:200]}'
+                return None, None, f'Refresh failed: HTTP {resp.status_code}: {_decode_response(resp)[:200]}'
             data = resp.json()
             access_token = (data.get('data') or {}).get('access_token')
             if not access_token:
@@ -255,14 +275,15 @@ def get_user_info(client, headers, site_config):
 
     try:
         response = client.get(f'{base_url}{user_info_path}', headers=headers, timeout=30)
+        text = _decode_response(response)
 
         if response.status_code == 200:
-            if not response.text or not response.text.strip():
+            if not text or not text.strip():
                 return {'success': False, 'error': 'Empty response from API'}
             try:
-                data = response.json()
-            except json.JSONDecodeError:
-                return {'success': False, 'error': f'Invalid JSON response: {response.text[:100]}'}
+                data = _json_of(response)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return {'success': False, 'error': f'Invalid JSON response: {text[:100]}'}
             if data.get('success') or 'data' in data:
                 user_data = data.get('data', {})
                 raw_quota = user_data.get('quota', 0)
@@ -282,7 +303,7 @@ def get_user_info(client, headers, site_config):
                     'display': f':money: Current balance: ${quota}, Used: ${used_quota}'
                 }
             return {'success': False, 'error': f'API returned: {data.get("message", "Unknown error")}'}
-        return {'success': False, 'error': f'HTTP {response.status_code}: {response.text[:100] if response.text else "No content"}'}
+        return {'success': False, 'error': f'HTTP {response.status_code}: {text[:100] if text else "No content"}'}
     except Exception as e:
         return {'success': False, 'error': f'Failed to get user info: {str(e)[:100]}'}
 
@@ -388,7 +409,7 @@ async def check_in_account(site_config, account_info, account_index):
 
         if response.status_code == 200:
             try:
-                result = response.json()
+                result = _json_of(response)
                 if check_success(result):
                     print(f'[SUCCESS] [{site_name}] {account_name}: Check-in successful!')
                     return True, user_info, (new_refresh if is_newapi else None)
@@ -400,8 +421,8 @@ async def check_in_account(site_config, account_info, account_index):
                         print(f'[SUCCESS] [{site_name}] {account_name}: Already checked in today')
                         return True, user_info, (new_refresh if is_newapi else None)
                     return False, user_info, (new_refresh if is_newapi else None)
-            except json.JSONDecodeError:
-                if 'success' in response.text.lower():
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                if 'success' in _decode_response(response).lower():
                     print(f'[SUCCESS] [{site_name}] {account_name}: Check-in successful!')
                     return True, user_info, (new_refresh if is_newapi else None)
                 else:
