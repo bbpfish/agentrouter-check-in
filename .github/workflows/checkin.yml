@@ -74,7 +74,6 @@ jobs:
       shell: pwsh
       env:
         HCN_ACCOUNTS: ${{ secrets.HCN_ACCOUNTS }}
-        JUSTWORKER_ACCOUNTS: ${{ secrets.JUSTWORKER_ACCOUNTS }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
         EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
@@ -95,7 +94,7 @@ jobs:
         GH_TOKEN: ${{ secrets.GH_TOKEN }}
       run: |
         $content = Get-Content -Raw checkin_output.txt -ErrorAction SilentlyContinue
-        foreach ($envName in @('HCN_ACCOUNTS','JUSTWORKER_ACCOUNTS')) {
+        foreach ($envName in @('HCN_ACCOUNTS')) {
           $pattern = '##' + $envName + '_B64##(\S+)'
           if ($content -match $pattern) {
             $b64 = $Matches[1]
