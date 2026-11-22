@@ -73,7 +73,6 @@ jobs:
     - name: 执行签到
       shell: pwsh
       env:
-        HCN_ACCOUNTS: ${{ secrets.HCN_ACCOUNTS }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
         EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
@@ -94,7 +93,8 @@ jobs:
         GH_TOKEN: ${{ secrets.GH_TOKEN }}
       run: |
         $content = Get-Content -Raw checkin_output.txt -ErrorAction SilentlyContinue
-        foreach ($envName in @('HCN_ACCOUNTS')) {
+        # 当前无启用站点，保留回写结构以便后续扩充（在数组中补充对应环境变量名即可）
+        foreach ($envName in @()) {
           $pattern = '##' + $envName + '_B64##(\S+)'
           if ($content -match $pattern) {
             $b64 = $Matches[1]

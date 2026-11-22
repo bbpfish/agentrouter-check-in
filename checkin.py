@@ -1,6 +1,6 @@
 ﻿#!/usr/bin/env python3
 """
-多站点自动签到脚本 - HCN 等 new-api 站点
+多站点自动签到脚本 - new-api 站点
 支持 new-api (QuantumNous/new-api) Bearer 认证：
 账号配置提供 refresh_token 时，自动 POST /api/user/auth/refresh 换取 access_token，
 并使用 Bearer 认证调用 self/checkin；refresh 会轮换 refresh_token，
@@ -26,24 +26,9 @@ load_dotenv()
 BALANCE_HASH_FILE = 'balance_hash.txt'
 
 # 站点配置
-SITES = {
-    'hcnsec': {
-        'name': 'HCN',
-        'base_url': 'https://api.hcnsec.cn',
-        'sign_in_path': '/api/user/checkin',
-        'user_info_path': '/api/user/self',
-        'accounts_env': 'HCN_ACCOUNTS',
-        'needs_waf': False,
-        # new-api Bearer 认证（refresh_token 模式）
-        'auth_mode': 'newapi_bearer',
-        'refresh_path': '/api/user/auth/refresh',
-        'refresh_cookie_name': 'new_api_refresh',
-        # HCN 签到成功判断：success==true
-        'check_success': lambda r: r.get('success') == True,
-        # HCN 余额直接显示（不换算）
-        'quota_divisor': 1,
-    },
-}
+# 已移除 hcnsec 站点：其 refresh_token 自 2026-10-27 起持续 401 失效，签到不再维护。
+# 如需新增站点，在此按同样的 dict 结构补充即可。
+SITES = {}
 
 
 def _decode_response(response):
