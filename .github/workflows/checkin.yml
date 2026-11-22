@@ -9,6 +9,9 @@ jobs:
   checkin:
     runs-on: windows-2025
     environment: production
+    permissions:
+      contents: read
+      issues: write
     env:
       PYTHONIOENCODING: utf-8
     steps:
@@ -84,8 +87,13 @@ jobs:
         WEIXIN_WEBHOOK: ${{ secrets.WEIXIN_WEBHOOK }}
       run: |
         $output = uv run checkin.py 2>&1 | Out-String
+        $code = $LASTEXITCODE
         Write-Output $output
         $output | Out-File -FilePath checkin_output.txt -Encoding utf8
+        if ($code -ne 0) {
+          Write-Output "::error::签到脚本退出码 $code"
+          exit $code
+        }
 
     - name: 同步轮换后的令牌到 Secrets
       if: always()
@@ -105,6 +113,57 @@ jobs:
           } else {
             Write-Output "No rotation payload for $envName, skip secret update"
           }
+        }
+
+    - name: 签到失败告警
+      if: failure()
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        $server = $env:GITHUB_SERVER_URL
+        $repo = $env:GITHUB_REPOSITORY
+        $runUrl = "$server/$repo/actions/runs/$env:GITHUB_RUN_ID"
+
+        $log = Get-Content -Raw checkin_output.txt -ErrorAction SilentlyContinue
+        if (-not $log) { $log = '(无输出或脚本未产生日志)' }
+        # 脱敏：JWT / base64 长串 / 常见 token 字段
+        $log = $log -replace 'eyJ[\w\-]{8,}\.[\w\-]{8,}\.[\w\-]{8,}', '***JWT***'
+        $log = $log -replace '(?i)("?(?:token|authorization|password|cookie)"?\s*[:=]\s*"?)[^\s",}]+', '$1***'
+        $log = $log -replace '[A-Za-z0-9\+/]{40,}={0,2}', '***'
+        if ($log.Length -gt 50000) { $log = $log.Substring($log.Length - 50000) }
+        $log = $log -replace '```', "'''"
+
+        $body = (@(
+          '### 自动签到失败',
+          '',
+          '| 项目 | 值 |',
+          '| --- | --- |',
+          "| 运行 | $runUrl |",
+          "| 分支 | $env:GITHUB_REF_NAME |",
+          "| 触发方式 | $env:GITHUB_EVENT_NAME |",
+          "| 时间(UTC) | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') |",
+          '',
+          '<details><summary>签到日志（尾部，已脱敏）</summary>',
+          '',
+          '<pre>',
+          $log,
+          '</pre>',
+          '',
+          '</details>'
+        ) -join "`n")
+
+        # 确保标签存在（幂等）
+        gh label create checkin-failure --repo $repo --color B60205 --description "自动签到失败告警" --force 2>$null | Out-Null
+
+        $existing = gh issue list --repo $repo --label checkin-failure --state open --limit 1 --json number --jq '.[0].number'
+        if ($existing) {
+          gh issue comment $existing --repo $repo --body $body
+          Write-Output "已在 Issue #$existing 追加失败记录（复用未关闭告警）"
+        } else {
+          $title = "签到失败: " + (Get-Date -Format 'yyyy-MM-dd HH:mm') + " (UTC)"
+          gh issue create --repo $repo --title $title --label checkin-failure --body $body
+          Write-Output "已创建失败告警 Issue"
         }
 
     - name: 执行结果
