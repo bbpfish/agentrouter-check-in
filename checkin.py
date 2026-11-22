@@ -28,7 +28,22 @@ BALANCE_HASH_FILE = 'balance_hash.txt'
 # 站点配置
 # 已移除 hcnsec 站点：其 refresh_token 自 2026-10-27 起持续 401 失效，签到不再维护。
 # 如需新增站点，在此按同样的 dict 结构补充即可。
-SITES = {}
+# auth_mode:
+#   newapi_bearer  - new-api 站点，refresh_token 换 access_token，Bearer 认证
+#   legacy_cookie  - 旧版 cookie + new-api-user 认证
+#   xboard_token   - Xboard(V2Board) 面板，Authorization 直接放 JWT 裸值（不可加 Bearer，否则 403）
+SITES = {
+    'pin': {
+        'name': 'Pin',
+        'base_url': 'https://8.217.204.148',
+        'api_prefix': '/api/v1',
+        'accounts_env': 'PIN_ACCOUNTS',
+        'auth_mode': 'xboard_token',
+        'verify_tls': False,  # 服务端使用裸 IP + ZeroSSL 证书，校验会失败
+        'sign_in_path': '/user/checkin',
+        'user_info_path': '/user/info',
+    },
+}
 
 
 def _decode_response(response):
@@ -51,7 +66,7 @@ def _json_of(response):
     return json.loads(_decode_response(response))
 
 
-def load_accounts(env_var):
+def load_accounts(env_var, auth_mode=None):
     """从环境变量加载多账号配置"""
     accounts_str = os.getenv(env_var)
     if not accounts_str:
@@ -67,11 +82,16 @@ def load_accounts(env_var):
             if not isinstance(account, dict):
                 print(f'ERROR: Account {i + 1} configuration format is incorrect')
                 return None
-            has_legacy = 'cookies' in account and 'api_user' in account
-            has_newapi = bool(account.get('refresh_token'))
-            if not (has_legacy or has_newapi):
-                print(f'ERROR: Account {i + 1} missing required fields (cookies+api_user or refresh_token)')
-                return None
+            if auth_mode == 'xboard_token':
+                if not account.get('token'):
+                    print(f'ERROR: Account {i + 1} missing required field (token)')
+                    return None
+            else:
+                has_legacy = 'cookies' in account and 'api_user' in account
+                has_newapi = bool(account.get('refresh_token'))
+                if not (has_legacy or has_newapi):
+                    print(f'ERROR: Account {i + 1} missing required fields (cookies+api_user or refresh_token)')
+                    return None
             if 'name' in account and not account['name']:
                 print(f'ERROR: Account {i + 1} name field cannot be empty')
                 return None
@@ -277,8 +297,121 @@ def get_user_info(client, headers, site_config):
         return {'success': False, 'error': f'Failed to get user info: {str(e)[:100]}'}
 
 
+def _xboard_headers(token):
+    """Xboard 面板认证头：Authorization 直接放 JWT 裸值，加 Bearer 会 403"""
+    return {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Content-Type': 'application/json',
+        'Authorization': token,
+    }
+
+
+def _xboard_user_info(client, api_base, headers):
+    """Xboard 用户信息 → 统一 user_info 结构（quota 单位 GB）"""
+    try:
+        resp = client.get(f'{api_base}/user/info', headers=headers, timeout=30)
+        text = _decode_response(resp)
+        if resp.status_code != 200:
+            return {'success': False, 'error': f'HTTP {resp.status_code}: {text[:100]}'}
+        data = _json_of(resp)
+        if data.get('status') != 'success' and 'data' not in data:
+            return {'success': False, 'error': f'API returned: {data.get("message", "Unknown error")}'}
+        user = data.get('data') or {}
+        traffic_gb = round(user.get('transfer_enable', 0) / (1024 ** 3), 2)
+        used_gb = round((user.get('u', 0) + user.get('d', 0)) / (1024 ** 3), 2)
+        return {
+            'success': True,
+            'quota': traffic_gb,
+            'used_quota': used_gb,
+            'display': f':package: {user.get("email", "")} total traffic: {traffic_gb}GB, used: {used_gb}GB',
+        }
+    except Exception as e:
+        return {'success': False, 'error': f'Failed to get user info: {str(e)[:100]}'}
+
+
+async def check_in_xboard(site_config, account_info, account_index):
+    """Xboard(V2Board) 面板签到：GET /user/checkinStatus → POST /user/checkin
+    重复签到返回 400「今天已经签到过了」，按幂等成功处理。"""
+    site_name = site_config['name']
+    api_base = f'{site_config["base_url"]}{site_config.get("api_prefix", "")}'
+    account_name = get_account_display_name(account_info, account_index)
+    token = account_info.get('token', '')
+
+    print(f'\n[PROCESSING] [{site_name}] Starting to process {account_name}')
+
+    if not token:
+        print(f'[FAILED] [{site_name}] {account_name}: Token not found')
+        return False, None
+
+    headers = _xboard_headers(token)
+    client = httpx.Client(timeout=30.0, verify=site_config.get('verify_tls', True), follow_redirects=True)
+
+    try:
+        user_info = _xboard_user_info(client, api_base, headers)
+        if user_info.get('success'):
+            print(user_info['display'])
+        else:
+            print(f'[WARN] [{site_name}] {account_name}: {user_info.get("error", "Unknown error")}')
+
+        try:
+            status_resp = client.get(f'{api_base}/user/checkinStatus', headers=headers, timeout=30)
+            if status_resp.status_code == 200:
+                status_data = _json_of(status_resp).get('data') or {}
+                print(f'[INFO] [{site_name}] {account_name}: checked days={status_data.get("checkin_days")}, '
+                      f'can_checkin={status_data.get("can_checkin")}, next={status_data.get("next_reward_traffic")}')
+        except Exception as e:
+            print(f'[WARN] [{site_name}] {account_name}: Failed to read checkin status: {str(e)[:80]}')
+
+        print(f'[NETWORK] [{site_name}] {account_name}: Executing check-in')
+        resp = client.post(f'{api_base}{site_config["sign_in_path"]}', headers=headers, timeout=30)
+        print(f'[RESPONSE] [{site_name}] {account_name}: Response status code {resp.status_code}')
+
+        success = False
+        try:
+            result = _json_of(resp)
+        except Exception:
+            result = {}
+
+        if resp.status_code == 200:
+            if result.get('status') == 'success' or result.get('data') is not None:
+                data = result.get('data') or {}
+                print(f'[SUCCESS] [{site_name}] {account_name}: Check-in successful! +{data.get("traffic", "?")} '
+                      f'(days={data.get("checkin_days", "?")})')
+                success = True
+            else:
+                print(f'[FAILED] [{site_name}] {account_name}: Check-in failed - '
+                      f'{result.get("message", "Unknown error")}')
+        else:
+            message = str(result.get('message', '')) or _decode_response(resp)[:100]
+            if resp.status_code == 400 and ('已签到' in message or '已经签到' in message or 'already' in message.lower()):
+                print(f'[SUCCESS] [{site_name}] {account_name}: Already checked in today')
+                success = True
+            else:
+                print(f'[FAILED] [{site_name}] {account_name}: Check-in failed - HTTP {resp.status_code}: {message}')
+
+        # 签到后重新拉取流量，供余额变化通知使用
+        if success:
+            refreshed = _xboard_user_info(client, api_base, headers)
+            if refreshed.get('success'):
+                user_info = refreshed
+
+        return success, user_info
+
+    except Exception as e:
+        print(f'[FAILED] [{site_name}] {account_name}: Error occurred during check-in process - {str(e)[:80]}')
+        return False, None
+    finally:
+        client.close()
+
+
 async def check_in_account(site_config, account_info, account_index):
     """为单个站点单个账号执行签到操作"""
+    if site_config.get('auth_mode') == 'xboard_token':
+        success, user_info = await check_in_xboard(site_config, account_info, account_index)
+        return success, user_info, None
+
     site_name = site_config['name']
     base_url = site_config['base_url']
     sign_in_path = site_config['sign_in_path']
@@ -417,7 +550,7 @@ async def process_site(site_key, site_config):
     print(f'[SYSTEM] {site_name} auto check-in started')
     print(f'{"=" * 60}')
 
-    accounts = load_accounts(env_var)
+    accounts = load_accounts(env_var, site_config.get('auth_mode'))
     if accounts is None:
         print(f'[INFO] {site_name}: No account configuration found ({env_var} not set), skipping')
         return [], None

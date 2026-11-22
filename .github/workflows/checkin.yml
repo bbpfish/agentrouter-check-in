@@ -73,6 +73,7 @@ jobs:
     - name: 执行签到
       shell: pwsh
       env:
+        PIN_ACCOUNTS: ${{ secrets.PIN_ACCOUNTS }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
         EMAIL_PASS: ${{ secrets.EMAIL_PASS }}

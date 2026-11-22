@@ -114,6 +114,30 @@
 - 支持部分账号失败，只要有账号成功签到，整个任务就不会失败
 - 报 401 错误，请重新获取 cookies，理论 1 个月失效
 
+## 支持的站点
+
+脚本通过 `checkin.py` 的 `SITES` 字典按站点类型扩展，每个站点对应一个独立的 `<SITE>_ACCOUNTS` Secret：
+
+| 站点 key | 站点类型 | accounts_env | 账号字段 | 认证方式 |
+| --- | --- | --- | --- | --- |
+| `pin` | Xboard(V2Board) 面板 | `PIN_ACCOUNTS` | `token` | `Authorization: <JWT 裸值>`（不可加 `Bearer`） |
+
+Xboard 站点账号配置示例：
+
+```json
+[
+  {
+    "name": "pin-account",
+    "token": "从浏览器 localStorage[\"token\"] 复制的 JWT"
+  }
+]
+```
+
+说明：
+- `token` 为面板会话 JWT，登录态长期有效，失效后重新取 `localStorage["token"]` 即可
+- 重复签到返回 400「今天已经签到过了」，脚本按幂等成功处理
+- 该站点服务端证书为 IP 直连的 ZeroSSL 证书，脚本对该站点关闭 TLS 校验（`verify_tls: False`）
+
 ## 配置示例
 
 假设你有两个账号需要签到：
