@@ -71,6 +71,10 @@ def load_accounts(env_var, auth_mode=None):
     accounts_str = os.getenv(env_var)
     if not accounts_str:
         return None
+    # 容错：Secret 可能带 UTF-8 BOM 或首尾空白
+    accounts_str = accounts_str.lstrip('\ufeff').strip()
+    if not accounts_str:
+        return None
 
     try:
         accounts_data = json.loads(accounts_str)
