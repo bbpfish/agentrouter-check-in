@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import platform
 import sys
 from datetime import datetime
 
@@ -32,6 +33,7 @@ BALANCE_HASH_FILE = 'balance_hash.txt'
 #   newapi_bearer  - new-api 站点，refresh_token 换 access_token，Bearer 认证
 #   legacy_cookie  - 旧版 cookie + new-api-user 认证
 #   xboard_token   - Xboard(V2Board) 面板，Authorization 直接放 JWT 裸值（不可加 Bearer，否则 403）
+#   trae_cloudide  - Trae CN 云 IDE，Authorization 为 'Cloud-IDE-JWT <token>'，必须携带设备号请求头
 SITES = {
     'pin': {
         'name': 'Pin',
@@ -42,6 +44,17 @@ SITES = {
         'verify_tls': False,  # 服务端使用裸 IP + ZeroSSL 证书，校验会失败
         'sign_in_path': '/user/checkin',
         'user_info_path': '/user/info',
+    },
+    'trae': {
+        'name': 'Trae CN',
+        'base_url': 'https://api.trae.cn',
+        'api_prefix': '/trae/api/v2',
+        'accounts_env': 'TRAE_ACCOUNTS',
+        'auth_mode': 'trae_cloudide',
+        'verify_tls': True,
+        'status_path': '/ug/checkin_credits/status',
+        'sign_in_path': '/ug/checkin_credits/claim',
+        'user_info_path': '/pay/user_current_entitlement_list',
     },
 }
 
@@ -86,7 +99,14 @@ def load_accounts(env_var, auth_mode=None):
             if not isinstance(account, dict):
                 print(f'ERROR: Account {i + 1} configuration format is incorrect')
                 return None
-            if auth_mode == 'xboard_token':
+            if auth_mode == 'trae_cloudide':
+                if not account.get('token'):
+                    print(f'ERROR: Account {i + 1} missing required field (token)')
+                    return None
+                if not str(account.get('device_id') or '').strip():
+                    print(f'ERROR: Account {i + 1} missing required field (device_id)')
+                    return None
+            elif auth_mode == 'xboard_token':
                 if not account.get('token'):
                     print(f'ERROR: Account {i + 1} missing required field (token)')
                     return None
@@ -410,8 +430,167 @@ async def check_in_xboard(site_config, account_info, account_index):
         client.close()
 
 
+TRAE_DEFAULT_UA = 'Trae/1.107.1'
+TRAE_DEFAULT_APP_VERSION = '1.107.1'
+
+# Trae 服务端错误码 → 可读原因
+TRAE_ERROR_HINTS = {
+    9074: 'device not registered（设备号未注册：x-device-id 不是服务端认可的设备，'
+          '需填入 Trae 客户端真实设备号）',
+    1001: 'token invalid or device context missing（令牌失效或缺少设备上下文：'
+          '请重新读取 accessToken，并确认请求已带 x-device-id）',
+    20405: 'device proof required（缺少设备上下文或设备证明）',
+}
+
+
+def _trae_headers(account_info):
+    """Trae CN 认证头：Authorization 必须为 'Cloud-IDE-JWT <token>'，加 Bearer 会鉴权失败"""
+    token = str(account_info.get('token') or '').strip()
+    headers = {
+        'Authorization': f'Cloud-IDE-JWT {token}',
+        'X-User-Region': 'CN',
+        'User-Agent': TRAE_DEFAULT_UA,
+        'Content-Type': 'application/json',
+        'x-device-id': str(account_info.get('device_id') or '').strip(),
+        'x-device-type': 'Windows',
+        'x-os-version': str(account_info.get('os_version') or platform.version() or ''),
+        'x-app-version': str(account_info.get('app_version') or TRAE_DEFAULT_APP_VERSION),
+    }
+    machine_id = str(account_info.get('machine_id') or '').strip()
+    if machine_id:
+        # 可选字段：服务端当前不强制校验，随请求带上以备后续风控要求
+        headers['x-machine-id'] = machine_id
+    return headers
+
+
+def _trae_error_text(result, http_status):
+    """把 Trae 响应错误码翻译成可读原因"""
+    code = result.get('code')
+    try:
+        code_int = int(code)
+    except (TypeError, ValueError):
+        code_int = None
+    message = str(result.get('message') or '').strip()
+    parts = [f'HTTP {http_status}']
+    if code is not None:
+        parts.append(f'code={code}')
+    if code_int in TRAE_ERROR_HINTS:
+        parts.append(TRAE_ERROR_HINTS[code_int])
+    if message:
+        parts.append(message[:120])
+    return ', '.join(parts)
+
+
+async def check_in_trae(site_config, account_info, account_index):
+    """Trae CN 签到：POST /ug/checkin_credits/status → 未签则 POST /ug/checkin_credits/claim
+    body 固定 '{}'；status 返回 checked_in/did_checked_in 为 true 即已签到，按幂等成功处理。"""
+    site_name = site_config['name']
+    api_base = f'{site_config["base_url"]}{site_config.get("api_prefix", "")}'
+    account_name = get_account_display_name(account_info, account_index)
+    token = str(account_info.get('token') or '').strip()
+    device_id = str(account_info.get('device_id') or '').strip()
+
+    print(f'\n[PROCESSING] [{site_name}] Starting to process {account_name}')
+
+    if not token:
+        print(f'[FAILED] [{site_name}] {account_name}: Token not found')
+        return False, None
+
+    if not device_id:
+        print(f'[FAILED] [{site_name}] {account_name}: device_id not found - '
+              f'Trae 校验设备上下文，缺少 x-device-id 会被拒绝 '
+              f'（典型返回 9074 device not registered 或 1001 无法认证），'
+              f'请在账号配置中补充 device_id')
+        return False, None
+
+    headers = _trae_headers(account_info)
+    client = httpx.Client(timeout=30.0, verify=site_config.get('verify_tls', True), follow_redirects=True)
+
+    try:
+        # 套餐接口仅用于日志观察，接口形态变化不影响签到主流程
+        user_info_path = site_config.get('user_info_path')
+        if user_info_path:
+            try:
+                info_resp = client.post(f'{api_base}{user_info_path}', headers=headers,
+                                        content='{}', timeout=30)
+                print(f'[INFO] [{site_name}] {account_name}: entitlement list HTTP {info_resp.status_code}')
+            except Exception as e:
+                print(f'[WARN] [{site_name}] {account_name}: Failed to read entitlement list: {str(e)[:80]}')
+
+        credits = None
+        extra_credits = None
+        status_path = site_config.get('status_path', '/ug/checkin_credits/status')
+        print(f'[NETWORK] [{site_name}] {account_name}: Querying check-in status')
+        status_resp = client.post(f'{api_base}{status_path}', headers=headers, content='{}', timeout=30)
+        print(f'[RESPONSE] [{site_name}] {account_name}: Status response code {status_resp.status_code}')
+
+        try:
+            status_result = _json_of(status_resp)
+        except Exception:
+            status_result = {}
+
+        credits = status_result.get('credits', credits)
+        extra_credits = status_result.get('extra_credits', extra_credits)
+        already_done = (status_result.get('checked_in') is True
+                        or status_result.get('did_checked_in') is True)
+
+        if status_resp.status_code == 200 and already_done:
+            print(f'[SUCCESS] [{site_name}] {account_name}: Already checked in today '
+                  f'(credits={credits}, extra={extra_credits})')
+        else:
+            if status_resp.status_code != 200:
+                print(f'[WARN] [{site_name}] {account_name}: Status query returned '
+                      f'{_trae_error_text(status_result, status_resp.status_code)}, trying claim anyway')
+
+            print(f'[NETWORK] [{site_name}] {account_name}: Executing check-in')
+            resp = client.post(f'{api_base}{site_config["sign_in_path"]}', headers=headers,
+                               content='{}', timeout=30)
+            print(f'[RESPONSE] [{site_name}] {account_name}: Response status code {resp.status_code}')
+
+            try:
+                result = _json_of(resp)
+            except Exception:
+                result = {}
+
+            message = str(result.get('message') or '')
+            try:
+                code_int = int(result.get('code'))
+            except (TypeError, ValueError):
+                code_int = None
+
+            if resp.status_code == 200 and code_int == 0:
+                credits = result.get('credits', credits)
+                extra_credits = result.get('extra_credits', extra_credits)
+                print(f'[SUCCESS] [{site_name}] {account_name}: Check-in successful! '
+                      f'(credits={credits}, extra={extra_credits})')
+            elif '已签' in message or '已经签' in message or 'already' in message.lower():
+                print(f'[SUCCESS] [{site_name}] {account_name}: Already checked in today')
+            else:
+                error_text = _trae_error_text(result, resp.status_code)
+                print(f'[FAILED] [{site_name}] {account_name}: Check-in failed - {error_text}')
+                return False, {'success': False, 'error': error_text}
+
+        user_info = {
+            'success': True,
+            'quota': credits if isinstance(credits, (int, float)) else 0,
+            'used_quota': 0,
+            'display': f':ticket: Trae CN credits: {credits} (extra: {extra_credits})',
+        }
+        return True, user_info
+
+    except Exception as e:
+        print(f'[FAILED] [{site_name}] {account_name}: Error occurred during check-in process - {str(e)[:80]}')
+        return False, None
+    finally:
+        client.close()
+
+
 async def check_in_account(site_config, account_info, account_index):
     """为单个站点单个账号执行签到操作"""
+    if site_config.get('auth_mode') == 'trae_cloudide':
+        success, user_info = await check_in_trae(site_config, account_info, account_index)
+        return success, user_info, None
+
     if site_config.get('auth_mode') == 'xboard_token':
         success, user_info = await check_in_xboard(site_config, account_info, account_index)
         return success, user_info, None

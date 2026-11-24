@@ -121,6 +121,7 @@
 | 站点 key | 站点类型 | accounts_env | 账号字段 | 认证方式 |
 | --- | --- | --- | --- | --- |
 | `pin` | Xboard(V2Board) 面板 | `PIN_ACCOUNTS` | `token` | `Authorization: <JWT 裸值>`（不可加 `Bearer`） |
+| `trae` | Trae CN 云 IDE | `TRAE_ACCOUNTS` | `token`、`device_id`（可选 `machine_id` / `app_version` / `os_version`） | `Authorization: Cloud-IDE-JWT <token>` + `x-device-id` 设备上下文 |
 
 Xboard 站点账号配置示例：
 
@@ -137,6 +138,28 @@ Xboard 站点账号配置示例：
 - `token` 为面板会话 JWT，登录态长期有效，失效后重新取 `localStorage["token"]` 即可
 - 重复签到返回 400「今天已经签到过了」，脚本按幂等成功处理
 - 该站点服务端证书为 IP 直连的 ZeroSSL 证书，脚本对该站点关闭 TLS 校验（`verify_tls: False`）
+
+Trae CN 站点账号配置示例：
+
+```json
+[
+  {
+    "name": "trae-account",
+    "token": "<Trae 客户端登录态中的 accessToken 占位符>",
+    "device_id": "<客户端设备号占位符>",
+    "machine_id": "<可选：设备指纹占位符>",
+    "app_version": "1.107.1",
+    "os_version": "<可选：不填则取本机 platform.version()>"
+  }
+]
+```
+
+说明：
+- `token` 为 Trae CN 客户端的 `accessToken`；`device_id` 为用户目录下 Trae CN 登录态中的设备号，**必填**，缺失时脚本直接判失败
+- 请求头必须为 `Authorization: Cloud-IDE-JWT <token>`（加 `Bearer` 会返回 `code=1001` 认证失败），并携带 `X-User-Region: CN`、`x-device-id`、`x-device-type: Windows`、`User-Agent: Trae/1.107.1`
+- 签到流程：先 `POST /ug/checkin_credits/status`（body 固定 `{}`），返回 `checked_in` / `did_checked_in` 为 `true` 即视为已签到；否则 `POST /ug/checkin_credits/claim`，`code == 0` 为成功，`message` 含「已签/已经签/already」按幂等成功处理
+- 常见错误码：`9074` 设备号未注册（`x-device-id` 不被认可）、`1001` 令牌失效或缺少设备上下文、`20405` 缺少设备证明，脚本会把上述错误码翻译成可读原因写入日志
+- 令牌策略：Actions 只持有 `accessToken`，不使用 `refreshToken` 刷新，因此该站点**不参与** Secret 回写；`accessToken` 过期需在本机重新读取后更新 `TRAE_ACCOUNTS` Secret
 
 ## 配置示例
 

@@ -76,6 +76,8 @@ jobs:
       shell: pwsh
       env:
         PIN_ACCOUNTS: ${{ secrets.PIN_ACCOUNTS }}
+        # Trae CN：仅存放 accessToken + 设备号，不做 refreshToken 轮换
+        TRAE_ACCOUNTS: ${{ secrets.TRAE_ACCOUNTS }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
         EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
